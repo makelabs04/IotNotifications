@@ -13,7 +13,7 @@
   'use strict';
 
   // ── CONFIGURE THIS URL to point to your Node.js server ──────────
-  const NODE_SERVER_URL = 'https://YOUR-NODE-SERVER.com'; // e.g. https://notify.makelearners.com:3000
+  const NODE_SERVER_URL = 'https://iotnotify.makelearners.com/'; // e.g. https://notify.makelearners.com:3000
 
   const IotPush = {
     _userId:     null,
