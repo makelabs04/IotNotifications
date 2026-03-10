@@ -36,14 +36,14 @@ async function getChannelsWithThresholds() {
   const [rows] = await db.execute(`
     SELECT
       id, name, channel_id, user_id,
-      field1_name, field1_min, field1_max,
-      field2_name, field2_min, field2_max,
-      field3_name, field3_min, field3_max,
-      field4_name, field4_min, field4_max,
-      field5_name, field5_min, field5_max,
-      field6_name, field6_min, field6_max,
-      field7_name, field7_min, field7_max,
-      field8_name, field8_min, field8_max
+      field1_name, field1_min, field1_max, field1_relay_auto, field1_relay_auto_min_cmd, field1_relay_auto_max_cmd,
+      field2_name, field2_min, field2_max, field2_relay_auto, field2_relay_auto_min_cmd, field2_relay_auto_max_cmd,
+      field3_name, field3_min, field3_max, field3_relay_auto, field3_relay_auto_min_cmd, field3_relay_auto_max_cmd,
+      field4_name, field4_min, field4_max, field4_relay_auto, field4_relay_auto_min_cmd, field4_relay_auto_max_cmd,
+      field5_name, field5_min, field5_max, field5_relay_auto, field5_relay_auto_min_cmd, field5_relay_auto_max_cmd,
+      field6_name, field6_min, field6_max, field6_relay_auto, field6_relay_auto_min_cmd, field6_relay_auto_max_cmd,
+      field7_name, field7_min, field7_max, field7_relay_auto, field7_relay_auto_min_cmd, field7_relay_auto_max_cmd,
+      field8_name, field8_min, field8_max, field8_relay_auto, field8_relay_auto_min_cmd, field8_relay_auto_max_cmd
     FROM channels
     WHERE
       field1_min IS NOT NULL OR field1_max IS NOT NULL OR
@@ -118,6 +118,21 @@ async function sendNotification(sub, payload) {
   }
 }
 
+
+// ── Auto Relay Writer ─────────────────────────────────────────────
+async function writeAutoRelay(channelDbId, fieldNum, command) {
+  const col = `relay${fieldNum}_command`;
+  try {
+    await db.execute(
+      `UPDATE channels SET ${col} = ? WHERE id = ?`,
+      [command, channelDbId]
+    );
+    console.log(`[auto-relay] channel=${channelDbId} relay${fieldNum} → ${command} (written to DB)`);
+  } catch (err) {
+    console.error(`[auto-relay] Failed to write relay: ${err.message}`);
+  }
+}
+
 // ── Main poll loop ────────────────────────────────────────────────
 async function pollAndNotify() {
   console.log(`\n[poller] ── Poll run at ${new Date().toISOString()} ──`);
@@ -181,6 +196,15 @@ async function pollAndNotify() {
         }
 
         markAlerted(alertKey);
+
+        // ── Auto relay: write command to DB if enabled ──
+        const relayAuto   = ch[`field${i}_relay_auto`];
+        const autoMinCmd  = ch[`field${i}_relay_auto_min_cmd`] || 'ON';
+        const autoMaxCmd  = ch[`field${i}_relay_auto_max_cmd`] || 'OFF';
+        if (relayAuto) {
+          const autoCmd = direction.includes('below') ? autoMinCmd : autoMaxCmd;
+          await writeAutoRelay(ch.id, i, autoCmd);
+        }
 
         const payload = {
           title:   `⚠️ ${ch.name} Alert`,
