@@ -1,27 +1,34 @@
 /**
  * server.js — IoT Push Notification Server
- * Runs alongside your PHP dashboard, uses the same MySQL database.
- * Deploy on Hostinger Node.js hosting.
+ * Serves both industrycontrol & relaycontrol dashboards.
  */
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const path       = require('path');
-const poller     = require('./poller');
+const express = require('express');
+const cors    = require('cors');
+const path    = require('path');
+const poller  = require('./poller');
 
 const app  = express();
 const PORT = parseInt(process.env.PORT || '3000');
 
-// ── CORS ──────────────────────────────────────────────────────────
+// ── CORS ───────────────────────────────────────────────────────────
+// Strip trailing slashes — browsers send origins WITHOUT them.
+// e.g. "https://example.com/" in .env must match "https://example.com"
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
-  .map(s => s.trim())
+  .map(s => s.trim().replace(/\/+$/, ''))   // <── removes trailing slash
   .filter(Boolean);
+
+console.log('[server] Allowed origins:', allowedOrigins);
 
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow requests with no origin (e.g. mobile, Postman) and whitelisted origins
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    // Allow no-origin requests (Postman, mobile, server-to-server)
+    if (!origin) return cb(null, true);
+    // Normalise the incoming origin too (just in case)
+    const normOrigin = origin.replace(/\/+$/, '');
+    if (allowedOrigins.includes(normOrigin)) return cb(null, true);
+    console.warn('[CORS] Blocked origin:', origin);
     cb(new Error('CORS blocked: ' + origin));
   },
   methods:     ['GET', 'POST', 'DELETE', 'OPTIONS'],
@@ -31,19 +38,20 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Routes ────────────────────────────────────────────────────────
+// ── Routes ─────────────────────────────────────────────────────────
 app.use('/api/subscribe', require('./routes/subscribe'));
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({
-    status:  'ok',
-    service: 'iot-push-notifier',
-    time:    new Date().toISOString(),
+    status:          'ok',
+    service:         'iot-push-notifier',
+    allowed_origins: allowedOrigins,
+    time:            new Date().toISOString(),
   });
 });
 
-// ── Start ─────────────────────────────────────────────────────────
+// ── Start ───────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[server] IoT Push Notifier running on port ${PORT}`);
   poller.start();
