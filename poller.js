@@ -18,9 +18,7 @@ const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://industrycontrol.mak
 // In-memory cooldown map: "channelId:fieldNum" → last alert timestamp (ms)
 const lastAlerted = new Map();
 
-// In-memory breach state: "channelId:fieldNum" → true if currently in breach
-// This lets us detect when a value RECOVERS (was breached, now back to normal)
-const breachState = new Map();
+// Tracks WHICH command was sent so recovery can send the exact opposite
 
 webpush.setVapidDetails(
   process.env.VAPID_EMAIL,
@@ -137,9 +135,6 @@ async function writeAutoRelay(channelDbId, fieldNum, command) {
 // ── Recovery command: opposite of the breach command ─────────────
 // If breach fired ON  → recovery fires OFF
 // If breach fired OFF → recovery fires ON
-function recoveryCommand(breachCmd) {
-  return breachCmd === 'ON' ? 'OFF' : 'ON';
-}
 
 // ── Main poll loop ────────────────────────────────────────────────
 async function pollAndNotify() {
@@ -194,39 +189,29 @@ async function pollAndNotify() {
           breachCmd = autoMaxCmd;
         }
 
-        const wasBreached = breachState.get(stateKey) || false;
+        // ── Determine correct relay state ─────────────────────────
+        // Logic:
+        //   < min  → autoMinCmd (ON)
+        //   > max  → autoMaxCmd (OFF)
+        //   normal → autoMinCmd (ON)  ← normal range = same as min breach cmd
+        //
+        // This means: relay is ON whenever value is in range OR below min,
+        // and OFF only when above max. Works for heating/pump use cases.
+        // Written EVERY poll so relay self-corrects after restarts.
 
-        // ── RECOVERY: value returned to normal ────────────────────
-        if (!breached && wasBreached) {
-          console.log(`[poller]   ✅ RECOVERY: field${i} "${fieldName}" back within limits`);
-          breachState.set(stateKey, false);
-
-          if (relayAuto) {
-            // We don't know which breach fired (min or max), so we pick the
-            // safe recovery: opposite of whichever command was most recently sent.
-            // Simple heuristic: if value is now above min → was a min breach → recovery = opposite of autoMinCmd
-            //                   (maxVal breach recovery handled symmetrically)
-            const recoverCmd = recoveryCommand(autoMinCmd); // default: opposite of min breach cmd
-            await writeAutoRelay(ch.id, i, recoverCmd);
-            console.log(`[auto-relay] Recovery → relay${i} set to ${recoverCmd}`);
-          }
-          continue;
+        if (relayAuto) {
+          const correctCmd = breached ? breachCmd : autoMinCmd;
+          await writeAutoRelay(ch.id, i, correctCmd);
+          console.log(`[auto-relay] field${i} value=${current} → relay${i}=${correctCmd} (${breached ? direction : 'normal range'})`);
         }
 
-        // ── NOT breached and wasn't before — all good ─────────────
+        // ── NOT breached — no push needed ────────────────────────
         if (!breached) {
           console.log(`[poller]   → Within limits ✓`);
           continue;
         }
 
-        // ── BREACH ───────────────────────────────────────────────
-        breachState.set(stateKey, true);
-
-        // Auto relay fires EVERY poll while breached (no cooldown gate for relay)
-        // This ensures relay stays in correct state even if poller restarts
-        if (relayAuto) {
-          await writeAutoRelay(ch.id, i, breachCmd);
-        }
+        // ── BREACH — send push notification ──────────────────────
 
         // Push notification respects cooldown
         const alertKey = `${ch.id}:field${i}`;
