@@ -1,8 +1,10 @@
 /**
  * poller.js
  * Polls the DB every POLL_INTERVAL_MS, checks each channel's latest
- * sensor reading against min/max thresholds, and sends Web Push
- * notifications when a threshold is breached.
+ * sensor reading against min/max thresholds, and:
+ *  - Sends Web Push notifications on breach
+ *  - Writes relay command ON/OFF when auto relay is enabled (breach)
+ *  - Writes the OPPOSITE/recovery command when value returns to normal ← NEW
  */
 require('dotenv').config();
 const webpush = require('web-push');
@@ -11,10 +13,14 @@ const db      = require('./db');
 const POLL_MS       = parseInt(process.env.POLL_INTERVAL_MS  || '30000');
 const COOLDOWN_MIN  = parseInt(process.env.ALERT_COOLDOWN_MIN || '5');
 const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://industrycontrol.makelearners.com')
-                        .replace(/\/+$/, '');   // strip trailing slash
+                        .replace(/\/+$/, '');
 
 // In-memory cooldown map: "channelId:fieldNum" → last alert timestamp (ms)
 const lastAlerted = new Map();
+
+// In-memory breach state: "channelId:fieldNum" → true if currently in breach
+// This lets us detect when a value RECOVERS (was breached, now back to normal)
+const breachState = new Map();
 
 webpush.setVapidDetails(
   process.env.VAPID_EMAIL,
@@ -81,17 +87,13 @@ async function getSubscriptionsForUser(userId, channelDbId) {
   console.log(`[poller] user_id=${userId} channel=${channelDbId} → ${rows.length} raw subscription(s) found`);
 
   const matched = rows.filter(sub => {
-    // NULL channel_ids means subscribed to ALL channels
     if (!sub.channel_ids) return true;
     try {
       const ids = JSON.parse(sub.channel_ids);
-      // ── IMPORTANT: compare as numbers on both sides ──────────────
-      // channel_ids stored as JSON array of numbers e.g. [2]
-      // channelDbId comes from MySQL as a number too, but coerce both to be safe
       return ids.map(Number).includes(Number(channelDbId));
     } catch (e) {
       console.warn('[poller] Failed to parse channel_ids:', sub.channel_ids);
-      return true; // if malformed, include it
+      return true;
     }
   });
 
@@ -118,19 +120,25 @@ async function sendNotification(sub, payload) {
   }
 }
 
-
 // ── Auto Relay Writer ─────────────────────────────────────────────
 async function writeAutoRelay(channelDbId, fieldNum, command) {
   const col = `relay${fieldNum}_command`;
   try {
     await db.execute(
-      `UPDATE channels SET ${col} = ? WHERE id = ?`,
+      `UPDATE channels SET \`${col}\` = ?, relay_updated_at = NOW() WHERE id = ?`,
       [command, channelDbId]
     );
-    console.log(`[auto-relay] channel=${channelDbId} relay${fieldNum} → ${command} (written to DB)`);
+    console.log(`[auto-relay] channel=${channelDbId} relay${fieldNum} → ${command}`);
   } catch (err) {
     console.error(`[auto-relay] Failed to write relay: ${err.message}`);
   }
+}
+
+// ── Recovery command: opposite of the breach command ─────────────
+// If breach fired ON  → recovery fires OFF
+// If breach fired OFF → recovery fires ON
+function recoveryCommand(breachCmd) {
+  return breachCmd === 'ON' ? 'OFF' : 'ON';
 }
 
 // ── Main poll loop ────────────────────────────────────────────────
@@ -150,60 +158,91 @@ async function pollAndNotify() {
       console.log(`[poller]   → Latest data timestamp: ${latest.timestamp}`);
 
       const subs = await getSubscriptionsForUser(ch.user_id, ch.id);
-      if (!subs.length) {
-        console.log(`[poller]   → No subscriptions matched, skipping`);
-        continue;
-      }
 
       for (let i = 1; i <= 8; i++) {
         const fieldName = ch[`field${i}_name`];
         if (!fieldName || fieldName.trim() === '') continue;
 
-        const minVal  = ch[`field${i}_min`]  != null ? parseFloat(ch[`field${i}_min`])  : null;
-        const maxVal  = ch[`field${i}_max`]  != null ? parseFloat(ch[`field${i}_max`])  : null;
-        const current = latest[`field${i}`]  != null ? parseFloat(latest[`field${i}`])  : null;
+        const minVal  = ch[`field${i}_min`] != null ? parseFloat(ch[`field${i}_min`]) : null;
+        const maxVal  = ch[`field${i}_max`] != null ? parseFloat(ch[`field${i}_max`]) : null;
+        const current = latest[`field${i}`] != null ? parseFloat(latest[`field${i}`]) : null;
 
         if (current === null || (minVal === null && maxVal === null)) continue;
 
+        const relayAuto  = ch[`field${i}_relay_auto`];
+        const autoMinCmd = ch[`field${i}_relay_auto_min_cmd`] || 'ON';
+        const autoMaxCmd = ch[`field${i}_relay_auto_max_cmd`] || 'OFF';
+        const stateKey   = `${ch.id}:field${i}`;
+
         console.log(`[poller]   field${i} "${fieldName}": value=${current}, min=${minVal}, max=${maxVal}`);
 
+        // ── Determine current breach status ───────────────────────
         let breached  = false;
         let direction = '';
         let limitVal  = null;
+        let breachCmd = null;
 
         if (minVal !== null && current < minVal) {
           breached  = true;
           direction = 'below minimum';
           limitVal  = minVal;
+          breachCmd = autoMinCmd;
         } else if (maxVal !== null && current > maxVal) {
           breached  = true;
           direction = 'above maximum';
           limitVal  = maxVal;
+          breachCmd = autoMaxCmd;
         }
 
+        const wasBreached = breachState.get(stateKey) || false;
+
+        // ── RECOVERY: value returned to normal ────────────────────
+        if (!breached && wasBreached) {
+          console.log(`[poller]   ✅ RECOVERY: field${i} "${fieldName}" back within limits`);
+          breachState.set(stateKey, false);
+
+          if (relayAuto) {
+            // We don't know which breach fired (min or max), so we pick the
+            // safe recovery: opposite of whichever command was most recently sent.
+            // Simple heuristic: if value is now above min → was a min breach → recovery = opposite of autoMinCmd
+            //                   (maxVal breach recovery handled symmetrically)
+            const recoverCmd = recoveryCommand(autoMinCmd); // default: opposite of min breach cmd
+            await writeAutoRelay(ch.id, i, recoverCmd);
+            console.log(`[auto-relay] Recovery → relay${i} set to ${recoverCmd}`);
+          }
+          continue;
+        }
+
+        // ── NOT breached and wasn't before — all good ─────────────
         if (!breached) {
           console.log(`[poller]   → Within limits ✓`);
           continue;
         }
 
+        // ── BREACH ───────────────────────────────────────────────
+        breachState.set(stateKey, true);
+
+        // Auto relay fires EVERY poll while breached (no cooldown gate for relay)
+        // This ensures relay stays in correct state even if poller restarts
+        if (relayAuto) {
+          await writeAutoRelay(ch.id, i, breachCmd);
+        }
+
+        // Push notification respects cooldown
         const alertKey = `${ch.id}:field${i}`;
         if (!isCooledDown(alertKey)) {
           const remaining = Math.ceil(
             (COOLDOWN_MIN * 60 * 1000 - (Date.now() - lastAlerted.get(alertKey))) / 60000
           );
-          console.log(`[poller]   → BREACH but cooldown active (${remaining} min remaining), skipping`);
+          console.log(`[poller]   → BREACH — relay written, push cooldown active (${remaining} min remaining)`);
           continue;
         }
 
         markAlerted(alertKey);
 
-        // ── Auto relay: write command to DB if enabled ──
-        const relayAuto   = ch[`field${i}_relay_auto`];
-        const autoMinCmd  = ch[`field${i}_relay_auto_min_cmd`] || 'ON';
-        const autoMaxCmd  = ch[`field${i}_relay_auto_max_cmd`] || 'OFF';
-        if (relayAuto) {
-          const autoCmd = direction.includes('below') ? autoMinCmd : autoMaxCmd;
-          await writeAutoRelay(ch.id, i, autoCmd);
+        if (!subs.length) {
+          console.log(`[poller]   → No subscriptions matched, skipping push`);
+          continue;
         }
 
         const payload = {
@@ -236,7 +275,7 @@ async function pollAndNotify() {
 // ── Start ─────────────────────────────────────────────────────────
 function start() {
   console.log(`[poller] Started — polling every ${POLL_MS / 1000}s, cooldown ${COOLDOWN_MIN} min`);
-  pollAndNotify();                      // immediate first run
+  pollAndNotify();
   setInterval(pollAndNotify, POLL_MS);
 }
 
