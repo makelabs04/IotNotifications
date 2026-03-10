@@ -2,23 +2,21 @@
  * poller.js
  * Polls the DB every POLL_INTERVAL_MS, checks each channel's latest
  * sensor reading against min/max thresholds, and:
- *  - Sends Web Push notifications on breach
+ *  - Sends Web Push notifications on breach (per-channel cooldown from DB)
  *  - Writes relay command ON/OFF when auto relay is enabled (breach)
- *  - Writes the OPPOSITE/recovery command when value returns to normal ← NEW
+ *  - Writes the recovery command when value returns to normal
  */
 require('dotenv').config();
 const webpush = require('web-push');
 const db      = require('./db');
 
-const POLL_MS       = parseInt(process.env.POLL_INTERVAL_MS  || '30000');
-const COOLDOWN_MIN  = parseInt(process.env.ALERT_COOLDOWN_MIN || '5');
-const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://industrycontrol.makelearners.com')
-                        .replace(/\/+$/, '');
+const POLL_MS           = parseInt(process.env.POLL_INTERVAL_MS   || '30000');
+const DEFAULT_COOLDOWN  = parseInt(process.env.ALERT_COOLDOWN_MIN  || '5');
+const DASHBOARD_URL     = (process.env.DASHBOARD_URL || 'https://industrycontrol.makelearners.com')
+                            .replace(/\/+$/, '');
 
 // In-memory cooldown map: "channelId:fieldNum" → last alert timestamp (ms)
 const lastAlerted = new Map();
-
-// Tracks WHICH command was sent so recovery can send the exact opposite
 
 webpush.setVapidDetails(
   process.env.VAPID_EMAIL,
@@ -27,9 +25,11 @@ webpush.setVapidDetails(
 );
 
 // ── Cooldown helpers ──────────────────────────────────────────────
-function isCooledDown(key) {
+// Uses per-channel cooldown from DB; falls back to .env default
+function isCooledDown(key, cooldownMin) {
   if (!lastAlerted.has(key)) return true;
-  return (Date.now() - lastAlerted.get(key)) > COOLDOWN_MIN * 60 * 1000;
+  const minutes = (cooldownMin != null && cooldownMin > 0) ? cooldownMin : DEFAULT_COOLDOWN;
+  return (Date.now() - lastAlerted.get(key)) > minutes * 60 * 1000;
 }
 function markAlerted(key) {
   lastAlerted.set(key, Date.now());
@@ -40,6 +40,7 @@ async function getChannelsWithThresholds() {
   const [rows] = await db.execute(`
     SELECT
       id, name, channel_id, user_id,
+      alert_cooldown_min,
       field1_name, field1_min, field1_max, field1_relay_auto, field1_relay_auto_min_cmd, field1_relay_auto_max_cmd,
       field2_name, field2_min, field2_max, field2_relay_auto, field2_relay_auto_min_cmd, field2_relay_auto_max_cmd,
       field3_name, field3_min, field3_max, field3_relay_auto, field3_relay_auto_min_cmd, field3_relay_auto_max_cmd,
@@ -132,10 +133,6 @@ async function writeAutoRelay(channelDbId, fieldNum, command) {
   }
 }
 
-// ── Recovery command: opposite of the breach command ─────────────
-// If breach fired ON  → recovery fires OFF
-// If breach fired OFF → recovery fires ON
-
 // ── Main poll loop ────────────────────────────────────────────────
 async function pollAndNotify() {
   console.log(`\n[poller] ── Poll run at ${new Date().toISOString()} ──`);
@@ -143,7 +140,12 @@ async function pollAndNotify() {
     const channels = await getChannelsWithThresholds();
 
     for (const ch of channels) {
-      console.log(`[poller] Checking channel: "${ch.name}" (id=${ch.id}, user_id=${ch.user_id})`);
+      // Per-channel cooldown: use DB value if set, else global default
+      const cooldownMin = (ch.alert_cooldown_min != null && ch.alert_cooldown_min > 0)
+        ? ch.alert_cooldown_min
+        : DEFAULT_COOLDOWN;
+
+      console.log(`[poller] Checking channel: "${ch.name}" (id=${ch.id}, cooldown=${cooldownMin}min)`);
 
       const latest = await getLatestData(ch.id);
       if (!latest) {
@@ -167,11 +169,10 @@ async function pollAndNotify() {
         const relayAuto  = ch[`field${i}_relay_auto`];
         const autoMinCmd = ch[`field${i}_relay_auto_min_cmd`] || 'ON';
         const autoMaxCmd = ch[`field${i}_relay_auto_max_cmd`] || 'OFF';
-        const stateKey   = `${ch.id}:field${i}`;
 
         console.log(`[poller]   field${i} "${fieldName}": value=${current}, min=${minVal}, max=${maxVal}`);
 
-        // ── Determine current breach status ───────────────────────
+        // ── Determine breach ──────────────────────────────────────
         let breached  = false;
         let direction = '';
         let limitVal  = null;
@@ -189,37 +190,25 @@ async function pollAndNotify() {
           breachCmd = autoMaxCmd;
         }
 
-        // ── Determine correct relay state ─────────────────────────
-        // Logic:
-        //   < min  → autoMinCmd (ON)
-        //   > max  → autoMaxCmd (OFF)
-        //   normal → autoMinCmd (ON)  ← normal range = same as min breach cmd
-        //
-        // This means: relay is ON whenever value is in range OR below min,
-        // and OFF only when above max. Works for heating/pump use cases.
-        // Written EVERY poll so relay self-corrects after restarts.
-
+        // ── Auto relay ────────────────────────────────────────────
         if (relayAuto) {
           const correctCmd = breached ? breachCmd : autoMinCmd;
           await writeAutoRelay(ch.id, i, correctCmd);
           console.log(`[auto-relay] field${i} value=${current} → relay${i}=${correctCmd} (${breached ? direction : 'normal range'})`);
         }
 
-        // ── NOT breached — no push needed ────────────────────────
+        // ── Not breached ──────────────────────────────────────────
         if (!breached) {
           console.log(`[poller]   → Within limits ✓`);
           continue;
         }
 
-        // ── BREACH — send push notification ──────────────────────
-
-        // Push notification respects cooldown
+        // ── Breach — check cooldown (uses per-channel value) ──────
         const alertKey = `${ch.id}:field${i}`;
-        if (!isCooledDown(alertKey)) {
-          const remaining = Math.ceil(
-            (COOLDOWN_MIN * 60 * 1000 - (Date.now() - lastAlerted.get(alertKey))) / 60000
-          );
-          console.log(`[poller]   → BREACH — relay written, push cooldown active (${remaining} min remaining)`);
+        if (!isCooledDown(alertKey, cooldownMin)) {
+          const elapsed   = Date.now() - lastAlerted.get(alertKey);
+          const remaining = Math.ceil((cooldownMin * 60 * 1000 - elapsed) / 60000);
+          console.log(`[poller]   → BREACH — push cooldown active (${remaining} min remaining, cooldown=${cooldownMin}min)`);
           continue;
         }
 
@@ -259,7 +248,7 @@ async function pollAndNotify() {
 
 // ── Start ─────────────────────────────────────────────────────────
 function start() {
-  console.log(`[poller] Started — polling every ${POLL_MS / 1000}s, cooldown ${COOLDOWN_MIN} min`);
+  console.log(`[poller] Started — polling every ${POLL_MS / 1000}s, default cooldown ${DEFAULT_COOLDOWN} min`);
   pollAndNotify();
   setInterval(pollAndNotify, POLL_MS);
 }
