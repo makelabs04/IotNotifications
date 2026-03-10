@@ -1,18 +1,19 @@
 /**
  * poller.js
- * Polls the database every POLL_INTERVAL_MS, checks each channel's latest
- * sensor reading against configured min/max thresholds, and sends Web Push
- * notifications to subscribed browsers when a threshold is breached.
+ * Polls the DB every POLL_INTERVAL_MS, checks each channel's latest
+ * sensor reading against min/max thresholds, and sends Web Push
+ * notifications when a threshold is breached.
  */
 require('dotenv').config();
-const webpush  = require('web-push');
-const db       = require('./db');
+const webpush = require('web-push');
+const db      = require('./db');
 
-const POLL_MS        = parseInt(process.env.POLL_INTERVAL_MS || '30000');
-const COOLDOWN_MIN   = parseInt(process.env.ALERT_COOLDOWN_MIN || '5');
-const DASHBOARD_URL  = process.env.DASHBOARD_URL || 'https://relaycontrol.makelearners.com';
+const POLL_MS       = parseInt(process.env.POLL_INTERVAL_MS  || '30000');
+const COOLDOWN_MIN  = parseInt(process.env.ALERT_COOLDOWN_MIN || '5');
+const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://industrycontrol.makelearners.com')
+                        .replace(/\/+$/, '');   // strip trailing slash
 
-// In-memory cooldown map: "channelId:fieldNum" -> last alert timestamp
+// In-memory cooldown map: "channelId:fieldNum" → last alert timestamp (ms)
 const lastAlerted = new Map();
 
 webpush.setVapidDetails(
@@ -21,16 +22,16 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 );
 
+// ── Cooldown helpers ──────────────────────────────────────────────
 function isCooledDown(key) {
   if (!lastAlerted.has(key)) return true;
-  const diffMs = Date.now() - lastAlerted.get(key);
-  return diffMs > COOLDOWN_MIN * 60 * 1000;
+  return (Date.now() - lastAlerted.get(key)) > COOLDOWN_MIN * 60 * 1000;
 }
-
 function markAlerted(key) {
   lastAlerted.set(key, Date.now());
 }
 
+// ── DB queries ────────────────────────────────────────────────────
 async function getChannelsWithThresholds() {
   const [rows] = await db.execute(`
     SELECT
@@ -54,6 +55,7 @@ async function getChannelsWithThresholds() {
       field7_min IS NOT NULL OR field7_max IS NOT NULL OR
       field8_min IS NOT NULL OR field8_max IS NOT NULL
   `);
+  console.log(`[poller] Found ${rows.length} channel(s) with thresholds configured`);
   return rows;
 }
 
@@ -70,24 +72,34 @@ async function getLatestData(channelDbId) {
 }
 
 async function getSubscriptionsForUser(userId, channelDbId) {
-  // Get all subscriptions for this user where channel is in their channel_ids list (or all)
   const [rows] = await db.execute(`
     SELECT endpoint, p256dh, auth_key, channel_ids
     FROM push_subscriptions
     WHERE user_id = ?
   `, [userId]);
 
-  return rows.filter(sub => {
-    if (!sub.channel_ids) return true; // subscribed to all channels
+  console.log(`[poller] user_id=${userId} channel=${channelDbId} → ${rows.length} raw subscription(s) found`);
+
+  const matched = rows.filter(sub => {
+    // NULL channel_ids means subscribed to ALL channels
+    if (!sub.channel_ids) return true;
     try {
       const ids = JSON.parse(sub.channel_ids);
-      return ids.includes(channelDbId);
+      // ── IMPORTANT: compare as numbers on both sides ──────────────
+      // channel_ids stored as JSON array of numbers e.g. [2]
+      // channelDbId comes from MySQL as a number too, but coerce both to be safe
+      return ids.map(Number).includes(Number(channelDbId));
     } catch (e) {
-      return true;
+      console.warn('[poller] Failed to parse channel_ids:', sub.channel_ids);
+      return true; // if malformed, include it
     }
   });
+
+  console.log(`[poller] → ${matched.length} matching subscription(s) for channel ${channelDbId}`);
+  return matched;
 }
 
+// ── Web Push sender ───────────────────────────────────────────────
 async function sendNotification(sub, payload) {
   const pushSub = {
     endpoint: sub.endpoint,
@@ -95,42 +107,54 @@ async function sendNotification(sub, payload) {
   };
   try {
     await webpush.sendNotification(pushSub, JSON.stringify(payload));
-    console.log('[push] Sent to', sub.endpoint.slice(-30));
+    console.log('[push] ✅ Sent to ...', sub.endpoint.slice(-40));
   } catch (err) {
     if (err.statusCode === 410 || err.statusCode === 404) {
-      // Subscription expired — remove it
-      console.log('[push] Expired subscription removed');
+      console.log('[push] ⚠️  Subscription expired — removing from DB');
       await db.execute('DELETE FROM push_subscriptions WHERE endpoint = ?', [sub.endpoint]);
     } else {
-      console.error('[push] Error:', err.message);
+      console.error('[push] ❌ Send error:', err.statusCode, err.message);
     }
   }
 }
 
+// ── Main poll loop ────────────────────────────────────────────────
 async function pollAndNotify() {
+  console.log(`\n[poller] ── Poll run at ${new Date().toISOString()} ──`);
   try {
     const channels = await getChannelsWithThresholds();
 
     for (const ch of channels) {
+      console.log(`[poller] Checking channel: "${ch.name}" (id=${ch.id}, user_id=${ch.user_id})`);
+
       const latest = await getLatestData(ch.id);
-      if (!latest) continue;
+      if (!latest) {
+        console.log(`[poller]   → No data rows yet, skipping`);
+        continue;
+      }
+      console.log(`[poller]   → Latest data timestamp: ${latest.timestamp}`);
 
       const subs = await getSubscriptionsForUser(ch.user_id, ch.id);
-      if (!subs.length) continue;
+      if (!subs.length) {
+        console.log(`[poller]   → No subscriptions matched, skipping`);
+        continue;
+      }
 
       for (let i = 1; i <= 8; i++) {
         const fieldName = ch[`field${i}_name`];
-        if (!fieldName) continue;
+        if (!fieldName || fieldName.trim() === '') continue;
 
-        const minVal   = ch[`field${i}_min`] !== null ? parseFloat(ch[`field${i}_min`]) : null;
-        const maxVal   = ch[`field${i}_max`] !== null ? parseFloat(ch[`field${i}_max`]) : null;
-        const current  = latest[`field${i}`] !== null ? parseFloat(latest[`field${i}`]) : null;
+        const minVal  = ch[`field${i}_min`]  != null ? parseFloat(ch[`field${i}_min`])  : null;
+        const maxVal  = ch[`field${i}_max`]  != null ? parseFloat(ch[`field${i}_max`])  : null;
+        const current = latest[`field${i}`]  != null ? parseFloat(latest[`field${i}`])  : null;
 
         if (current === null || (minVal === null && maxVal === null)) continue;
 
-        let breached   = false;
-        let direction  = '';
-        let limitVal   = null;
+        console.log(`[poller]   field${i} "${fieldName}": value=${current}, min=${minVal}, max=${maxVal}`);
+
+        let breached  = false;
+        let direction = '';
+        let limitVal  = null;
 
         if (minVal !== null && current < minVal) {
           breached  = true;
@@ -142,10 +166,19 @@ async function pollAndNotify() {
           limitVal  = maxVal;
         }
 
-        if (!breached) continue;
+        if (!breached) {
+          console.log(`[poller]   → Within limits ✓`);
+          continue;
+        }
 
         const alertKey = `${ch.id}:field${i}`;
-        if (!isCooledDown(alertKey)) continue;
+        if (!isCooledDown(alertKey)) {
+          const remaining = Math.ceil(
+            (COOLDOWN_MIN * 60 * 1000 - (Date.now() - lastAlerted.get(alertKey))) / 60000
+          );
+          console.log(`[poller]   → BREACH but cooldown active (${remaining} min remaining), skipping`);
+          continue;
+        }
 
         markAlerted(alertKey);
 
@@ -163,7 +196,7 @@ async function pollAndNotify() {
           ts:      new Date().toISOString(),
         };
 
-        console.log(`[alert] ${ch.name} → ${fieldName} = ${current} (${direction} ${limitVal})`);
+        console.log(`[poller]   🚨 ALERT: "${ch.name}" → field${i} "${fieldName}" = ${current} (${direction} ${limitVal})`);
 
         for (const sub of subs) {
           await sendNotification(sub, payload);
@@ -171,13 +204,15 @@ async function pollAndNotify() {
       }
     }
   } catch (err) {
-    console.error('[poller] Error during poll:', err.message);
+    console.error('[poller] ❌ Error during poll:', err.message);
+    console.error(err.stack);
   }
 }
 
+// ── Start ─────────────────────────────────────────────────────────
 function start() {
-  console.log(`[poller] Started. Polling every ${POLL_MS / 1000}s, cooldown ${COOLDOWN_MIN}min`);
-  pollAndNotify(); // immediate first run
+  console.log(`[poller] Started — polling every ${POLL_MS / 1000}s, cooldown ${COOLDOWN_MIN} min`);
+  pollAndNotify();                      // immediate first run
   setInterval(pollAndNotify, POLL_MS);
 }
 
